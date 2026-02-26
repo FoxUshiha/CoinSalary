@@ -22,7 +22,7 @@
 ## ⚙️ Dependências
 
 ### Obrigatórias
-- **[CoinCard](https://github.com/seu-repo/coincard)** - Para transações de coins
+- **[CoinCard]([https://github.com/seu-repo/coincard](https://github.com/FoxUshiha/CoinCard))** - Para transações de coins
 - **[Vault](https://www.spigotmc.org/resources/vault.34315/)** - Para gerenciamento de permissões/grupos
 
 ### Recomendadas
@@ -31,7 +31,7 @@
 ## 📥 Instalação
 
 1. Certifique-se de ter o **CoinCard** e **Vault** instalados no servidor
-2. Baixe o arquivo `CoinSalary.jar` da [última release](https://github.com/seu-repo/coinsalary/releases)
+2. Baixe o arquivo `CoinSalary.jar` da [última release]([https://github.com/seu-repo/coinsalary/releases](https://github.com/FoxUshiha/CoinSalary))
 3. Coloque o arquivo na pasta `plugins/` do seu servidor
 4. Reinicie o servidor ou execute `/reload`
 5. Configure o arquivo `plugins/CoinSalary/config.yml`

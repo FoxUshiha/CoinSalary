@@ -1,0 +1,26 @@
+# CoinSalary Configuration
+# Server Card ID for paying salaries
+Server: "e1301fadfc35"
+
+# Cooldown between transactions in milliseconds
+Cooldown: 1100
+
+# Interval in seconds between automatic salary payments
+# Example: 10 = 10 seconds, 3600 = 1 hour
+Interval: 3600
+
+# Whether or not to pay offline users
+offline: false
+
+# Salary Groups Configuration
+# Each group is checked via Vault permissions
+# The amount is in coins (can be decimal)
+Groups:
+  default: 0.00000000
+  vip: 0.00000055
+  admin: 0.00100000
+  builder: 0.00050000
+  # Add more groups as needed:
+  # moderator: 0.00020000
+  # helper: 0.00010000
+  # elite: 0.00200000

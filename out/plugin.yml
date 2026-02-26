@@ -1,0 +1,76 @@
+name: CoinSalary
+version: 1.2
+main: com.foxsrv.coinsalary.CoinSalary
+api-version: 1.13
+author: FoxOficial2
+description: A Player Coin Salary plugin with CoinCard integration
+depend: [CoinCard, Vault]
+softdepend: [PlaceholderAPI]
+
+commands:
+  salary:
+    description: Main CoinSalary command
+    aliases: [sal, coinsalary]
+    usage: |
+      /salary - Show help
+      /salary reload - Reload configuration
+      /salary next - Force run salary task now (pays everyone, ignores cooldown)
+      /salary check [player] - Check salary amount
+      /salary pay <player> - Manually pay salary
+      /salary group list - List all groups
+      /salary group <group> [amount] - Set/remove group
+      /salary test <player> - Test show player groups
+    permission: coinsalary.use
+  salaries:
+    description: List all salary groups
+    aliases: [sals, salarylist]
+    usage: /salaries
+    permission: coinsalary.use
+
+permissions:
+  coinsalary.*:
+    description: All CoinSalary permissions
+    default: op
+    children:
+      coinsalary.use: true
+      coinsalary.admin: true
+      coinsalary.group.vip: true
+      coinsalary.group.admin: true
+      coinsalary.group.builder: true
+      coinsalary.group.moderator: true
+      coinsalary.group.helper: true
+      coinsalary.group.elite: true
+      
+  coinsalary.use:
+    description: Use basic CoinSalary features (check own salary, view groups)
+    default: true
+    
+  coinsalary.admin:
+    description: Admin commands (reload, next, pay, group, test)
+    default: op
+    
+  # Permissões para grupos específicos (opcional - para controle fino)
+  # Estas permissões são apenas para referência - o plugin usa Vault
+  coinsalary.group.vip:
+    description: VIP salary group (managed by Vault)
+    default: false
+    
+  coinsalary.group.admin:
+    description: Admin salary group (managed by Vault)
+    default: false
+    
+  coinsalary.group.builder:
+    description: Builder salary group (managed by Vault)
+    default: false
+    
+  coinsalary.group.moderator:
+    description: Moderator salary group (managed by Vault)
+    default: false
+    
+  coinsalary.group.helper:
+    description: Helper salary group (managed by Vault)
+    default: false
+    
+  coinsalary.group.elite:
+    description: Elite salary group (managed by Vault)
+    default: false

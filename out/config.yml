@@ -16,7 +16,7 @@ offline: false
 # Each group is checked via Vault permissions
 # The amount is in coins (can be decimal)
 Groups:
-  default: 0.00000000
+  default: 0.00000001
   vip: 0.00000055
   admin: 0.00100000
   builder: 0.00050000

@@ -24,9 +24,7 @@ import java.math.RoundingMode;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.*;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 public class CoinSalary extends JavaPlugin implements Listener {
@@ -76,6 +74,36 @@ public class CoinSalary extends JavaPlugin implements Listener {
     private final Map<UUID, List<String>> playerGroupsCache = new ConcurrentHashMap<>();
     private final Map<UUID, Long> playerGroupsCacheTimestamp = new ConcurrentHashMap<>();
     private static final long GROUPS_CACHE_DURATION = 10 * 60 * 1000; // 10 minutos
+    
+    // ====================================================
+    // PAYMENT QUEUE SYSTEM
+    // ====================================================
+    private final BlockingQueue<PaymentTask> paymentQueue = new LinkedBlockingQueue<>();
+    private boolean isProcessingQueue = false;
+    private final Object queueLock = new Object();
+    private ScheduledExecutorService queueExecutor;
+    private CompletableFuture<Void> queueProcessingFuture;
+
+    /**
+     * Classe interna para representar uma tarefa de pagamento
+     */
+    private static class PaymentTask {
+        final OfflinePlayer player;
+        final BigDecimal amount;
+        final String playerCardId;
+        final String playerName;
+        final boolean isOnline;
+        final UUID uuid;
+        
+        PaymentTask(OfflinePlayer player, BigDecimal amount, String playerCardId) {
+            this.player = player;
+            this.amount = amount;
+            this.playerCardId = playerCardId;
+            this.playerName = player.getName() != null ? player.getName() : "Unknown";
+            this.isOnline = player.isOnline();
+            this.uuid = player.getUniqueId();
+        }
+    }
 
     // ====================================================
     // ON ENABLE / DISABLE
@@ -115,11 +143,19 @@ public class CoinSalary extends JavaPlugin implements Listener {
         COIN_FORMAT.setMinimumFractionDigits(0);
         COIN_FORMAT.setMaximumFractionDigits(8);
 
+        // Initialize queue executor
+        queueExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "CoinSalary-Queue-Processor");
+            t.setDaemon(true);
+            return t;
+        });
+
         startSalaryTask();
 
         getLogger().info("CoinSalary v" + getDescription().getVersion() + " enabled successfully with CoinCard integration!");
         getLogger().info("Salary interval: " + salaryIntervalSeconds + " seconds");
         getLogger().info("Pay offline players: " + payOffline);
+        getLogger().info("Transaction cooldown: " + cooldownMs + "ms");
         getLogger().info("Loaded " + groupSalaries.size() + " salary groups");
     }
 
@@ -128,6 +164,19 @@ public class CoinSalary extends JavaPlugin implements Listener {
         if (salaryTask != null) {
             salaryTask.cancel();
         }
+        
+        // Shutdown queue executor gracefully
+        if (queueExecutor != null) {
+            queueExecutor.shutdown();
+            try {
+                if (!queueExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    queueExecutor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                queueExecutor.shutdownNow();
+            }
+        }
+        
         saveLastSalaryData();
         cardCache.clear();
         cardCacheTimestamp.clear();
@@ -497,87 +546,140 @@ public class CoinSalary extends JavaPlugin implements Listener {
         }
     }
     
+    // ====================================================
+    // PAYMENT QUEUE PROCESSING
+    // ====================================================
+    
     /**
-     * Envia salario para um jogador (totalmente assincrono)
+     * Adiciona um pagamento a fila para processamento assincrono
      */
-    private void paySalaryAsync(OfflinePlayer player, BigDecimal amount) {
-        if (player == null || amount == null || amount.compareTo(BigDecimal.ZERO) <= 0) {
+    private void queuePayment(OfflinePlayer player, BigDecimal amount, String playerCardId) {
+        PaymentTask task = new PaymentTask(player, amount, playerCardId);
+        paymentQueue.offer(task);
+        getLogger().info("Added " + task.playerName + " to payment queue. Queue size: " + paymentQueue.size());
+        
+        // Iniciar processamento da fila se nao estiver rodando
+        startQueueProcessing();
+    }
+    
+    /**
+     * Inicia o processamento da fila de pagamentos (se ja nao estiver rodando)
+     */
+    private synchronized void startQueueProcessing() {
+        if (isProcessingQueue) {
             return;
         }
         
-        UUID uuid = player.getUniqueId();
-        String playerName = player.getName() != null ? player.getName() : "Unknown";
+        isProcessingQueue = true;
+        getLogger().info("Starting payment queue processor...");
         
-        // Verificar se o jogador tem card (assincrono)
-        hasPlayerCardAsync(uuid).thenAccept(hasCard -> {
-            if (!hasCard) {
+        queueProcessingFuture = CompletableFuture.runAsync(() -> {
+            while (isProcessingQueue) {
+                try {
+                    // Pegar proximo item da fila (bloqueante)
+                    PaymentTask task = paymentQueue.poll(1, TimeUnit.SECONDS);
+                    
+                    if (task == null) {
+                        // Fila vazia, verificar se devemos parar
+                        synchronized (queueLock) {
+                            if (paymentQueue.isEmpty()) {
+                                isProcessingQueue = false;
+                                getLogger().info("Payment queue processor stopped (queue empty)");
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    
+                    // Processar o pagamento
+                    processSinglePayment(task);
+                    
+                    // Aguardar o cooldown configurado antes do proximo pagamento
+                    Thread.sleep(cooldownMs);
+                    
+                } catch (InterruptedException e) {
+                    getLogger().warning("Payment queue processor interrupted");
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    getLogger().severe("Error in payment queue processor: " + e.getMessage());
+                }
+            }
+        }, queueExecutor);
+    }
+    
+    /**
+     * Processa um unico pagamento da fila
+     */
+    private void processSinglePayment(PaymentTask task) {
+        final double fAmount = task.amount.doubleValue();
+        final String fPlayerCard = task.playerCardId;
+        final String fServerCard = serverCardId;
+        final String playerName = task.playerName;
+        final OfflinePlayer player = task.player;
+        
+        getLogger().info("Processing queue payment: " + formatCoin(task.amount) + " to " + playerName);
+        
+        // Usar CountDownLatch para aguardar o callback
+        CountDownLatch latch = new CountDownLatch(1);
+        final boolean[] success = {false};
+        final String[] errorMsg = {null};
+        
+        // Executar transferencia na thread do CoinCard (ja estamos em thread separada)
+        coinCardAPI.transfer(fServerCard, fPlayerCard, fAmount, new TransferCallback() {
+            @Override
+            public void onSuccess(String txId, double amount) {
+                success[0] = true;
+                
+                // Notificar jogador se estiver online (voltar para main thread)
                 if (player.isOnline()) {
-                    Player onlinePlayer = player.getPlayer();
-                    if (onlinePlayer != null) {
-                        onlinePlayer.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to receive salary.");
-                    }
-                }
-                getLogger().info("Player " + playerName + " has no card set, skipping salary");
-                return;
-            }
-            
-            // Verificar se o servidor tem card configurado
-            if (serverCardId == null || serverCardId.isEmpty()) {
-                getLogger().warning("Server card not configured! Cannot pay salary to " + playerName);
-                return;
-            }
-            
-            // Obter card ID do jogador (assincrono)
-            getPlayerCardIdAsync(uuid).thenAccept(playerCardId -> {
-                if (playerCardId == null || playerCardId.isEmpty()) {
-                    getLogger().warning("Could not get card ID for " + playerName);
-                    return;
+                    Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
+                        Player onlinePlayer = player.getPlayer();
+                        if (onlinePlayer != null) {
+                            onlinePlayer.sendMessage(ChatColor.GREEN + "You received salary: " + 
+                                    ChatColor.YELLOW + formatCoin(BigDecimal.valueOf(amount)) + 
+                                    ChatColor.GREEN + " coins! Transaction: " + 
+                                    ChatColor.AQUA + (txId != null ? txId : "-"));
+                        }
+                    });
                 }
                 
-                final double fAmount = amount.doubleValue();
-                final String fPlayerCard = playerCardId;
-                final String fServerCard = serverCardId;
+                getLogger().info("Queue payment successful: " + formatCoin(BigDecimal.valueOf(amount)) + 
+                        " to " + playerName + " tx=" + txId);
                 
-                getLogger().info("Paying salary " + formatCoin(amount) + " to " + playerName + 
-                                " (online=" + player.isOnline() + ")");
-                
-                // Enviar transferencia de forma assincrona
-                coinCardAPI.transfer(fServerCard, fPlayerCard, fAmount, new TransferCallback() {
-                    @Override
-                    public void onSuccess(String txId, double amount) {
-                        Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
-                            // Notificar jogador se estiver online
-                            if (player.isOnline()) {
-                                Player onlinePlayer = player.getPlayer();
-                                if (onlinePlayer != null) {
-                                    onlinePlayer.sendMessage(ChatColor.GREEN + "You received salary: " + 
-                                            ChatColor.YELLOW + formatCoin(BigDecimal.valueOf(amount)) + 
-                                            ChatColor.GREEN + " coins! Transaction: " + 
-                                            ChatColor.AQUA + (txId != null ? txId : "-"));
-                                }
-                            }
-                            
-                            getLogger().info("Paid salary " + formatCoin(BigDecimal.valueOf(amount)) + 
-                                    " to " + playerName + " (online=" + player.isOnline() + ") tx=" + txId);
-                        });
-                    }
+                latch.countDown();
+            }
 
-                    @Override
-                    public void onFailure(String error) {
-                        Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
-                            getLogger().warning("Failed to pay salary to " + playerName + ": " + error);
-                            
-                            if (player.isOnline()) {
-                                Player onlinePlayer = player.getPlayer();
-                                if (onlinePlayer != null) {
-                                    onlinePlayer.sendMessage(ChatColor.RED + "Failed to receive salary: " + error);
-                                }
-                            }
-                        });
-                    }
-                });
-            });
+            @Override
+            public void onFailure(String error) {
+                success[0] = false;
+                errorMsg[0] = error;
+                
+                // Notificar jogador se estiver online (voltar para main thread)
+                if (player.isOnline()) {
+                    Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
+                        Player onlinePlayer = player.getPlayer();
+                        if (onlinePlayer != null) {
+                            onlinePlayer.sendMessage(ChatColor.RED + "Failed to receive salary: " + error);
+                        }
+                    });
+                }
+                
+                getLogger().warning("Queue payment failed for " + playerName + ": " + error);
+                
+                latch.countDown();
+            }
         });
+        
+        // Aguardar callback (com timeout)
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                getLogger().warning("Payment timeout for " + playerName);
+            }
+        } catch (InterruptedException e) {
+            getLogger().warning("Payment interrupted for " + playerName);
+            Thread.currentThread().interrupt();
+        }
     }
 
     // ====================================================
@@ -675,7 +777,7 @@ public class CoinSalary extends JavaPlugin implements Listener {
         // Salvar dados apos forcar todos os pagamentos
         saveLastSalaryData();
         
-        getLogger().info("Force salary processing completed!");
+        getLogger().info("Force salary processing completed! Queue size: " + paymentQueue.size());
     }
     
     /**
@@ -706,7 +808,36 @@ public class CoinSalary extends JavaPlugin implements Listener {
         calculateSalaryAsync(player).thenAccept(salary -> {
             // Pagar se houver salario
             if (salary.compareTo(BigDecimal.ZERO) > 0) {
-                paySalaryAsync(player, salary);
+                // Verificar se o jogador tem card
+                hasPlayerCardAsync(uuid).thenAccept(hasCard -> {
+                    if (!hasCard) {
+                        if (player.isOnline()) {
+                            Player onlinePlayer = player.getPlayer();
+                            if (onlinePlayer != null) {
+                                onlinePlayer.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to receive salary.");
+                            }
+                        }
+                        getLogger().info("Player " + player.getName() + " has no card set, skipping salary");
+                        return;
+                    }
+                    
+                    // Verificar se o servidor tem card configurado
+                    if (serverCardId == null || serverCardId.isEmpty()) {
+                        getLogger().warning("Server card not configured! Cannot pay salary to " + player.getName());
+                        return;
+                    }
+                    
+                    // Obter card ID do jogador (assincrono)
+                    getPlayerCardIdAsync(uuid).thenAccept(playerCardId -> {
+                        if (playerCardId == null || playerCardId.isEmpty()) {
+                            getLogger().warning("Could not get card ID for " + player.getName());
+                            return;
+                        }
+                        
+                        // Adicionar a fila de pagamentos
+                        queuePayment(player, salary, playerCardId);
+                    });
+                });
             }
         });
     }
@@ -786,6 +917,7 @@ public class CoinSalary extends JavaPlugin implements Listener {
         public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
             sender.sendMessage(ChatColor.YELLOW + "=== CoinSalary Groups ===");
             sender.sendMessage(ChatColor.GRAY + "Interval: " + ChatColor.WHITE + formatTime(salaryIntervalSeconds));
+            sender.sendMessage(ChatColor.GRAY + "Cooldown: " + ChatColor.WHITE + cooldownMs + "ms");
             sender.sendMessage(ChatColor.GRAY + "Pay offline: " + (payOffline ? ChatColor.GREEN + "Yes" : ChatColor.RED + "No"));
             sender.sendMessage("");
             
@@ -799,6 +931,11 @@ public class CoinSalary extends JavaPlugin implements Listener {
                 sender.sendMessage(ChatColor.GRAY + "  * " + ChatColor.WHITE + entry.getKey() + 
                         ChatColor.GRAY + " -> " + ChatColor.GREEN + formatCoin(entry.getValue()));
             }
+            
+            // Mostrar fila de pagamentos
+            sender.sendMessage("");
+            sender.sendMessage(ChatColor.GRAY + "Payment queue: " + ChatColor.YELLOW + paymentQueue.size() + 
+                    ChatColor.GRAY + " pending | " + (isProcessingQueue ? ChatColor.GREEN + "Processing" : ChatColor.RED + "Idle"));
             
             // Mostrar proxima execucao
             if (lastSalaryData.lastTaskRun > 0) {
@@ -881,6 +1018,14 @@ public class CoinSalary extends JavaPlugin implements Listener {
                     handleTestCommand(sender, args);
                     break;
                     
+                case "queue":
+                    if (!sender.hasPermission("coinsalary.admin")) {
+                        sender.sendMessage(ChatColor.RED + "You don't have permission!");
+                        return true;
+                    }
+                    handleQueueCommand(sender);
+                    break;
+                    
                 default:
                     sender.sendMessage(ChatColor.RED + "Unknown command. Use /salary for help.");
                     break;
@@ -894,6 +1039,7 @@ public class CoinSalary extends JavaPlugin implements Listener {
             sender.sendMessage(ChatColor.GREEN + "/salary reload " + ChatColor.GRAY + "- Reload configuration");
             sender.sendMessage(ChatColor.GREEN + "/salary next " + ChatColor.GRAY + "- Force run salary task now (pays everyone, ignores cooldown)");
             sender.sendMessage(ChatColor.GREEN + "/salary check [player] " + ChatColor.GRAY + "- Check salary amount");
+            sender.sendMessage(ChatColor.GREEN + "/salary queue " + ChatColor.GRAY + "- Show payment queue status");
             sender.sendMessage(ChatColor.GREEN + "/salaries " + ChatColor.GRAY + "- List all salary groups");
             
             if (sender.hasPermission("coinsalary.admin")) {
@@ -915,6 +1061,7 @@ public class CoinSalary extends JavaPlugin implements Listener {
             
             sender.sendMessage(ChatColor.GREEN + "CoinSalary configuration reloaded!");
             sender.sendMessage(ChatColor.GRAY + "Interval: " + salaryIntervalSeconds + " seconds");
+            sender.sendMessage(ChatColor.GRAY + "Cooldown: " + cooldownMs + "ms");
             sender.sendMessage(ChatColor.GRAY + "Pay offline: " + payOffline);
             sender.sendMessage(ChatColor.GRAY + "Groups loaded: " + groupSalaries.size());
         }
@@ -922,7 +1069,19 @@ public class CoinSalary extends JavaPlugin implements Listener {
         private void handleNext(CommandSender sender) {
             sender.sendMessage(ChatColor.YELLOW + "Forcing salary task to run now (pays everyone, ignores cooldown)...");
             forceRunSalaryTask();
-            sender.sendMessage(ChatColor.GREEN + "Salary task executed!");
+            sender.sendMessage(ChatColor.GREEN + "Salary task executed! Payments added to queue.");
+        }
+        
+        private void handleQueueCommand(CommandSender sender) {
+            sender.sendMessage(ChatColor.YELLOW + "=== Payment Queue Status ===");
+            sender.sendMessage(ChatColor.GRAY + "Queue size: " + ChatColor.YELLOW + paymentQueue.size());
+            sender.sendMessage(ChatColor.GRAY + "Processing: " + (isProcessingQueue ? ChatColor.GREEN + "Yes" : ChatColor.RED + "No"));
+            sender.sendMessage(ChatColor.GRAY + "Cooldown: " + ChatColor.WHITE + cooldownMs + "ms between transactions");
+            
+            if (!paymentQueue.isEmpty()) {
+                sender.sendMessage(ChatColor.GRAY + "Estimated time: " + ChatColor.YELLOW + 
+                        formatTime((paymentQueue.size() * cooldownMs) / 1000));
+            }
         }
         
         private void handleGroupCommand(CommandSender sender, String[] args) {
@@ -1111,6 +1270,8 @@ public class CoinSalary extends JavaPlugin implements Listener {
                 return;
             }
             
+            sender.sendMessage(ChatColor.YELLOW + "Processing manual payment for " + targetName + "...");
+            
             // Calcular salario assincrono
             calculateSalaryAsync(target).thenAccept(salary -> {
                 if (salary.compareTo(BigDecimal.ZERO) <= 0) {
@@ -1120,16 +1281,36 @@ public class CoinSalary extends JavaPlugin implements Listener {
                     return;
                 }
                 
-                // Atualizar timestamp antes de pagar
-                lastSalaryTime.put(target.getUniqueId(), System.currentTimeMillis());
-                saveLastSalaryData();
-                
-                // Forcar pagamento
-                paySalaryAsync(target, salary);
-                
-                Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
-                    sender.sendMessage(ChatColor.GREEN + "Manual salary payment sent to " + targetName + 
-                            " for " + formatCoin(salary));
+                // Verificar se o jogador tem card
+                hasPlayerCardAsync(target.getUniqueId()).thenAccept(hasCard -> {
+                    if (!hasCard) {
+                        Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
+                            sender.sendMessage(ChatColor.RED + targetName + " has no CoinCard configured!");
+                        });
+                        return;
+                    }
+                    
+                    // Obter card ID
+                    getPlayerCardIdAsync(target.getUniqueId()).thenAccept(cardId -> {
+                        if (cardId == null || cardId.isEmpty()) {
+                            Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
+                                sender.sendMessage(ChatColor.RED + "Could not get card ID for " + targetName);
+                            });
+                            return;
+                        }
+                        
+                        // Atualizar timestamp antes de pagar
+                        lastSalaryTime.put(target.getUniqueId(), System.currentTimeMillis());
+                        saveLastSalaryData();
+                        
+                        // Adicionar a fila
+                        queuePayment(target, salary, cardId);
+                        
+                        Bukkit.getScheduler().runTask(CoinSalary.this, () -> {
+                            sender.sendMessage(ChatColor.GREEN + "Manual salary payment for " + targetName + 
+                                    " added to queue. Amount: " + formatCoin(salary));
+                        });
+                    });
                 });
             });
         }
@@ -1142,6 +1323,7 @@ public class CoinSalary extends JavaPlugin implements Listener {
                 completions.add("reload");
                 completions.add("next");
                 completions.add("check");
+                completions.add("queue");
                 if (sender.hasPermission("coinsalary.admin")) {
                     completions.add("pay");
                     completions.add("group");
@@ -1170,7 +1352,7 @@ public class CoinSalary extends JavaPlugin implements Listener {
             }
             
             if (args.length == 3 && args[0].equalsIgnoreCase("group")) {
-                // Sugerir 0.00000000 como valor padrao
+                // Sugerir valores padrao
                 completions.add("0.00000000");
                 completions.add("0.00000055");
                 completions.add("0.00100000");

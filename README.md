@@ -22,7 +22,7 @@
 ## ⚙️ Dependências
 
 ### Obrigatórias
-- **[CoinCard]([https://github.com/seu-repo/coincard](https://github.com/FoxUshiha/CoinCard))** - Para transações de coins
+- **[CoinCard](https://github.com/FoxUshiha/CoinCard)** - Para transações de coins
 - **[Vault](https://www.spigotmc.org/resources/vault.34315/)** - Para gerenciamento de permissões/grupos
 
 ### Recomendadas
